@@ -1,0 +1,11 @@
+.ruff_cache
+.venv
+dist
+uv.lock
+
+benchmarks
+misc
+.coverage
+__pycache__
+*.py,cover
+*.ps1

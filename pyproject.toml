@@ -1,0 +1,29 @@
+[project]
+name = "rapidpipe"
+version = "1.0.0"
+description = "A lightweight package to create and manage data pipelines."
+readme = "README.md"
+authors = [{ name = "HectorTablero", email = "hector.tablerodiaz@gmail.com" }]
+requires-python = ">=3.11"
+dependencies = ["networkx>=3.5", "numpy>=2.4.4"]
+
+[project.scripts]
+rapidpipe = "rapidpipe:main"
+
+[build-system]
+requires = ["uv_build>=0.8.22,<0.9.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "dask>=2026.3.0",
+    "fastparquet>=2026.3.0",
+    "joblib>=1.5.3",
+    "matplotlib>=3.10.9",
+    "pandas>=3.0.2",
+    "psutil>=7.2.2",
+    "pyarrow>=24.0.0",
+    "pytest>=8.3.5",
+    "pytest-cov>=6.0.0",
+    "ray>=2.55.1",
+]
