@@ -184,7 +184,7 @@ class DependencyGraph:
     def _resolve(self, dep: DependencyInfo) -> Optional[Tuple[str, str]]:
         """Resolve a dependency specifier into a concrete layer and output name."""
         if dep.is_pipeline_dependency:
-            layer = self._pipeline.outputs.provider_of(dep.output_name)
+            layer = dep.resolved_layer
             return (layer, dep.output_name) if layer else None
         return (dep.layer_name, dep.output_name)
 
@@ -331,9 +331,10 @@ class Pipeline(Layer):
 
         if any(l.name == layer.name for l in self._layers):
             raise ValueError(
-                f"A layer with name '{layer.name}' already exists.")
+                f"A layer with name '{layer.name}' already exists."
+            )
 
-        # Validate current-value dependencies
+        # Validate current-value dependencies (existence of providers)
         for dep in layer.parsed_dependencies.values():
             if dep.access_type == AccessType.PIPELINE_CURRENT:
                 is_provided = any(
@@ -354,6 +355,20 @@ class Pipeline(Layer):
                         f"Layer '{layer.name}' has a dependency on '{dep.layer_name}.{dep.output_name}', "
                         "but that layer is not registered or does not provide that output."
                     )
+
+        # --- NEW: Resolve pipeline dependencies to the most recent provider (last in order) ---
+        for dep in layer.parsed_dependencies.values():
+            if dep.is_pipeline_dependency:
+                # Find the most recently added layer that outputs this name
+                last_provider = None
+                # iterate from last added to first
+                for existing in reversed(self._layers):
+                    if dep.output_name in existing.outputs:
+                        last_provider = existing.name
+                        break
+                # Note: if last_provider is None, validation above would have raised an error
+                dep.resolved_layer = last_provider
+        # ---------------------------------------------------------------------------------------
 
         layer.add_to_pipeline(self)
         self._layers.append(layer)
@@ -1034,14 +1049,8 @@ class Pipeline(Layer):
         if layer is None:
             return None
 
-        if dep.access_type == AccessType.CURRENT:
+        if dep.access_type in (AccessType.CURRENT, AccessType.PIPELINE_CURRENT):
             return snapshot.get(layer, {}).get(out)
-
-        if dep.access_type == AccessType.PIPELINE_CURRENT:
-            provider_layer = self._pipeline_outputs.provider_of(out)
-            if provider_layer:
-                return snapshot.get(provider_layer, {}).get(out)
-            return None
 
         if dep.access_type in (AccessType.INDEXED, AccessType.PIPELINE_INDEXED):
             hist = self._history[layer][out]
@@ -1158,10 +1167,12 @@ class Pipeline(Layer):
             if layer_name == "__inputs__":
                 continue
             if layer_name not in current_layer_names:
-                raise ValueError(f"State mismatch: Layer '{layer_name}' found in state file but not in the pipeline.")
+                raise ValueError(
+                    f"State mismatch: Layer '{layer_name}' found in state file but not in the pipeline.")
             for out in outputs:
                 if (layer_name, out) not in expected_outputs:
-                    raise ValueError(f"State mismatch: Output '{layer_name}.{out}' found in state file but is not expected in the pipeline.")
+                    raise ValueError(
+                        f"State mismatch: Output '{layer_name}.{out}' found in state file but is not expected in the pipeline.")
 
         self._cycle_count = state.get("cycle_count", 0)
         self._inactive_layers = set(state.get("inactive_layers", []))
@@ -1172,7 +1183,8 @@ class Pipeline(Layer):
         self._history.clear()
         for layer, outs in state.get("history", {}).items():
             for out, entries in outs.items():
-                self._history[layer][out] = deque(entries, maxlen=self._max_history_size)
+                self._history[layer][out] = deque(
+                    entries, maxlen=self._max_history_size)
 
         for layer in self._layers:
             layer_state = state.get("layer_states", {}).get(layer.name)

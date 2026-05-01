@@ -1,6 +1,6 @@
 [project]
 name = "rapidpipe"
-version = "1.0.1"
+version = "1.0.2"
 description = "A lightweight package to create and manage data pipelines."
 readme = "README.md"
 authors = [{ name = "HectorTablero", email = "hector.tablerodiaz@gmail.com" }]

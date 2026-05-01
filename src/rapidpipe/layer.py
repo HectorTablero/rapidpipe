@@ -59,6 +59,7 @@ class DependencyInfo:
     time_start: Optional[float] = None
     time_end: Optional[float] = None
     is_pipeline_dependency: bool = False
+    resolved_layer: Optional[str] = None
 
     def __repr__(self) -> str:
         prefix = "pipeline." if self.is_pipeline_dependency else f"{self.layer_name}."
