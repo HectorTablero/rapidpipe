@@ -38,3 +38,32 @@ def test_numba_layer_warm_up():
     # warm_up should call the kernel
     DummyWarmUpLayer.warm_up(5)
     # We can't assert much unless we mock the kernel, but it shouldn't crash
+
+
+def test_numba_layer_invalid_kernel_not_staticmethod():
+    with pytest.raises(TypeError, match="The 'kernel' method must be declared as a @staticmethod"):
+        class InvalidKernelLayer(NumbaLayer):
+            def kernel(self, x):
+                return x
+
+
+def test_numba_layer_multiple_outputs_warning():
+    with pytest.warns(UserWarning, match="kernel return type hint"):
+        class MultiOutputLayer(NumbaLayer, nopython=False):
+            @staticmethod
+            def kernel(x: float) -> float:
+                return x
+
+        _ = MultiOutputLayer(name="multi", outputs=["out1", "out2"])
+
+
+def test_numba_layer_missing_input_keyerror():
+    class MissingInputLayer(NumbaLayer, nopython=False):
+        @staticmethod
+        def kernel(x, y):
+            return x * y
+
+    layer = MissingInputLayer(name="dummy", outputs=["out"])
+
+    with pytest.raises(KeyError, match="Missing required input for Numba kernel: 'y'"):
+        layer.process(x=5)

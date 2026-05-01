@@ -262,6 +262,24 @@ class Layer(ABC):
         """Called once after the pipeline stops. Use for cleanup."""
         pass
 
+    def on_complete(self) -> None:
+        """Called when a producer layer raises LayerComplete. Override to react to completions."""
+        pass
+
+    def get_state(self) -> Dict[str, Any]:
+        """
+        Return a dictionary of internal state to be serialized by the pipeline.
+        Override this to save custom state variables when `save_state()` is called.
+        """
+        return {}
+
+    def set_state(self, state: Dict[str, Any]) -> None:
+        """
+        Restore internal state from a dictionary when `load_state()` is called.
+        Override this to handle loading custom state variables.
+        """
+        pass
+
     # --------------------------------------------------------------------- #
     #  Internal helpers                                                     #
     # --------------------------------------------------------------------- #

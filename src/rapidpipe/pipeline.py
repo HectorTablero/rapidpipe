@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import pickle
 import time
+import logging
+import concurrent.futures
 from collections import defaultdict, deque
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -15,6 +17,8 @@ from rapidpipe.layer import (
 )
 from rapidpipe.metrics import MetricsCollector
 from rapidpipe.utils.visualizer import visualize_pipeline
+
+logger = logging.getLogger(__name__)
 
 
 # --------------------------------------------------------------------------- #
@@ -64,6 +68,17 @@ class PipelineOutputs:
         """List all output names currently registered in the pipeline."""
         return list(self._available_outputs)
 
+    def __iter__(self):
+        """Iterate over the declared exports (output names) of the pipeline."""
+        if hasattr(self._pipeline, "_output_names"):
+            return iter(self._pipeline._output_names or [])
+        return iter([])
+
+    def __len__(self):
+        if hasattr(self._pipeline, "_output_names"):
+            return len(self._pipeline._output_names or [])
+        return len(self._available_outputs)
+
     # ---- internal helpers -------------------------------------------------- #
     def _register(self, output_name: str, layer_name: str) -> None:
         """Called when a layer is added to register its outputs."""
@@ -83,6 +98,8 @@ class PipelineOutputs:
 
     def provider_of(self, output_name: str) -> Optional[str]:
         """Return the name of the layer providing the given output."""
+        if output_name in self._pipeline.parsed_dependencies:
+            return "__inputs__"
         return self._output_providers.get(output_name)
 
 
@@ -131,6 +148,11 @@ class DependencyGraph:
             for out in layer.outputs:
                 self._graph.add_node((layer.name, out))
                 self._current_dependency_graph.add_node((layer.name, out))
+
+        # Register the virtual __inputs__ pseudo-layer that provides parent dependencies
+        for input_name in self._pipeline.parsed_dependencies.keys():
+            self._graph.add_node(("__inputs__", input_name))
+            self._current_dependency_graph.add_node(("__inputs__", input_name))
 
         # 2. Add edges + compute storage needs
         for consumer in layers.values():
@@ -236,6 +258,8 @@ class Pipeline(Layer):
         self._layers: List[Layer] = []
         self._max_history_size = max_history_size
         self._metrics = metrics
+        self._thread_pool = concurrent.futures.ThreadPoolExecutor(
+            thread_name_prefix="rapidpipe_worker")
 
         # Unified history store
         self._current_values: Dict[str, Dict[str, Any]] = defaultdict(dict)
@@ -245,6 +269,7 @@ class Pipeline(Layer):
 
         self._cycle_count = 0
         self._running = False
+        self._started = False
 
         # Fine-grained dependency scheduling (replaces tier-barrier approach)
         # layer -> set of producer layer names
@@ -313,7 +338,7 @@ class Pipeline(Layer):
             if dep.access_type == AccessType.PIPELINE_CURRENT:
                 is_provided = any(
                     dep.output_name in lyr.outputs for lyr in self._layers
-                )
+                ) or (dep.output_name in self.parsed_dependencies)
                 if not is_provided:
                     raise ValueError(
                         f"Layer '{layer.name}' has a dependency on pipeline output '{dep.output_name}', "
@@ -323,7 +348,7 @@ class Pipeline(Layer):
                 is_provided = any(
                     lyr.name == dep.layer_name and dep.output_name in lyr.outputs
                     for lyr in self._layers
-                )
+                ) or (dep.layer_name == "__inputs__" and dep.output_name in self.parsed_dependencies)
                 if not is_provided:
                     raise ValueError(
                         f"Layer '{layer.name}' has a dependency on '{dep.layer_name}.{dep.output_name}', "
@@ -360,6 +385,8 @@ class Pipeline(Layer):
         old = self._layers.pop(idx)
         for out in old.outputs:
             self._pipeline_outputs._remove_provider(out, old.name)
+        if old.name in self._inactive_layers:
+            self._inactive_layers.remove(old.name)
         self._graph.rebuild()
         self._recompute_scheduling()
         self._garbage_collect()
@@ -420,6 +447,10 @@ class Pipeline(Layer):
         full_consumers: Dict[str, set] = {
             layer.name: set() for layer in self._layers}
 
+        # Seed __inputs__
+        full_consumers["__inputs__"] = set()
+        consumers["__inputs__"] = set()
+
         for consumer in self._layers:
             for dep in consumer.parsed_dependencies.values():
                 src = self._graph._resolve(dep)
@@ -477,12 +508,30 @@ class Pipeline(Layer):
 
     # ---- run methods ------------------------------------------------------- #
 
+    def _has_async_layers(self) -> bool:
+        return any(m == ExecutionMode.ASYNC for m in self._effective_execution_modes.values())
+
     def run(self) -> None:
         """
         Blocking, synchronous entry point to start the continuous execution loop.
-        Creates a new event loop and runs until stopped or a PipelineStop is raised.
+        Creates a new event loop unless no ASYNC mode exists (then runs natively).
         """
-        asyncio.run(self._async_run_loop())
+        if self._has_async_layers():
+            asyncio.run(self._async_run_loop())
+        else:
+            self._running = True
+            self._call_on_start()
+            try:
+                while self._running:
+                    try:
+                        self._process_cycle_sync()
+                    except PipelineStop:
+                        break
+                    except Exception as e:
+                        raise RuntimeError(f"Pipeline error: {e}") from e
+            finally:
+                self._running = False
+                self._call_on_stop()
 
     async def run_async(self) -> None:
         """
@@ -494,20 +543,49 @@ class Pipeline(Layer):
     def run_sequence(self, n: int) -> None:
         """
         Run exactly N execution cycles synchronously, then stop.
-
-        Args:
-            n: Number of pipeline cycles to compute.
         """
-        asyncio.run(self._run_n(n))
+        if self._has_async_layers():
+            asyncio.run(self._run_n(n))
+        else:
+            self._running = True
+            self._call_on_start()
+            try:
+                for _ in range(n):
+                    if not self._running:
+                        break
+                    try:
+                        self._process_cycle_sync()
+                    except PipelineStop:
+                        break
+                    except Exception as e:
+                        raise RuntimeError(f"Pipeline error: {e}") from e
+            finally:
+                self._running = False
+                self._call_on_stop()
 
     def run_until(self, predicate: Callable[[Pipeline], bool]) -> None:
         """
         Run synchronously until a given callable predicate returns True.
-
-        Args:
-            predicate: A function that takes the pipeline instance and returns a boolean.
         """
-        asyncio.run(self._run_until(predicate))
+        if self._has_async_layers():
+            asyncio.run(self._run_until(predicate))
+        else:
+            self._running = True
+            self._call_on_start()
+            try:
+                while self._running:
+                    try:
+                        self._process_cycle_sync()
+                    except PipelineStop:
+                        break
+                    except Exception as e:
+                        raise RuntimeError(f"Pipeline error: {e}") from e
+
+                    if predicate(self):
+                        break
+            finally:
+                self._running = False
+                self._call_on_stop()
 
     async def _async_run_loop(self) -> None:
         self._running = True
@@ -562,14 +640,44 @@ class Pipeline(Layer):
         """Gracefully interrupt and stop the running pipeline."""
         self._running = False
 
+    def reset(self) -> None:
+        """
+        Reset pipeline execution state. Clears inactive layers and empties history, 
+        allowing a fresh restart of continuous tasks.
+        """
+        self._inactive_layers.clear()
+        self._current_values.clear()
+        self._history.clear()
+        self._cycle_count = 0
+
     # ---- lifecycle --------------------------------------------------------- #
+    def on_start(self) -> None:
+        """Ensure nested pipeline initializes its components during parent startup."""
+        super().on_start()
+        self._call_on_start()
+
+    def on_stop(self) -> None:
+        """Ensure nested pipeline cleans up its components during parent shutdown."""
+        super().on_stop()
+        self._call_on_stop()
+
     def _call_on_start(self) -> None:
+        if self._started:
+            return
+        self._started = True
+        self._thread_pool = concurrent.futures.ThreadPoolExecutor(
+            thread_name_prefix="rapidpipe_worker")
         for layer in self._layers:
             layer.on_start()
 
     def _call_on_stop(self) -> None:
+        if not self._started:
+            return
+        self._started = False
         for layer in self._layers:
             layer.on_stop()
+        if hasattr(self, '_thread_pool') and self._thread_pool:
+            self._thread_pool.shutdown(wait=False, cancel_futures=True)
 
     # ---- core processing --------------------------------------------------- #
     async def _process_cycle(self) -> None:
@@ -600,6 +708,14 @@ class Pipeline(Layer):
             for layer_name, outputs in self._current_values.items()
         }
         all_produced: Dict[str, Dict[str, Any]] = {}
+
+        # Inject external inputs into the pseudo-layer "__inputs__"
+        if self._external_inputs:
+            # We copy them so layers modifying kwargs don't mutate parent inputs
+            ext_inputs = dict(self._external_inputs)
+            snapshot["__inputs__"] = ext_inputs
+            all_produced["__inputs__"] = ext_inputs
+
         name_to_layer = {l.name: l for l in self._layers}
 
         # Pending-count: how many producers each layer is still waiting for
@@ -607,6 +723,11 @@ class Pipeline(Layer):
             name: len(producers)
             for name, producers in self._layer_producers.items()
         }
+
+        # __inputs__ is already resolved immediately
+        if self._external_inputs:
+            for consumer_name in self._layer_consumers.get("__inputs__", set()):
+                pending[consumer_name] -= 1
 
         pipeline_stop = False
         in_flight: set = set()          # set of asyncio.Task
@@ -618,19 +739,46 @@ class Pipeline(Layer):
             in_flight.add(task)
             task_to_layer[task] = layer
 
+        def _handle_layer_complete(layer: Layer) -> None:
+            if layer.name not in self._inactive_layers:
+                self._inactive_layers.add(layer.name)
+                for consumer_name in self._layer_consumers.get(layer.name, set()):
+                    consumer = name_to_layer[consumer_name]
+                    try:
+                        consumer.on_complete()
+                    except LayerComplete:
+                        _handle_layer_complete(consumer)
+
+            for consumer_name in self._layer_consumers.get(layer.name, set()):
+                pending[consumer_name] -= 1
+                if pending[consumer_name] == 0:
+                    consumer = name_to_layer[consumer_name]
+                    if (
+                        consumer.name not in self._inactive_layers
+                        and self._should_run(consumer, snapshot)
+                    ):
+                        _schedule_layer(consumer)
+
         # Seed: schedule every layer with zero pending producers
-        for layer in self._layers:
+        ready_queue = deque(
+            [layer for layer in self._layers if pending.get(layer.name, 0) == 0])
+
+        while ready_queue:
+            layer = ready_queue.popleft()
             if layer.name in self._inactive_layers:
                 # Treat inactive as instantly done — unblock consumers
                 for consumer_name in self._layer_consumers.get(layer.name, set()):
                     pending[consumer_name] -= 1
+                    if pending.get(consumer_name, 0) == 0:
+                        ready_queue.append(name_to_layer[consumer_name])
                 continue
             if not self._should_run(layer, snapshot):
                 for consumer_name in self._layer_consumers.get(layer.name, set()):
                     pending[consumer_name] -= 1
+                    if pending.get(consumer_name, 0) == 0:
+                        ready_queue.append(name_to_layer[consumer_name])
                 continue
-            if pending.get(layer.name, 0) == 0:
-                _schedule_layer(layer)
+            _schedule_layer(layer)
 
         # Drain in-flight tasks one-by-one as they complete
         while in_flight:
@@ -645,12 +793,16 @@ class Pipeline(Layer):
                 if exc is not None:
                     if isinstance(exc, PipelineStop):
                         pipeline_stop = True
-                        # Cancel remaining tasks
                         for t in in_flight:
                             t.cancel()
-                        in_flight.clear()
-                        break
-                    raise exc
+                        continue
+                    elif isinstance(exc, asyncio.CancelledError):
+                        continue
+                    elif isinstance(exc, LayerComplete):
+                        _handle_layer_complete(layer)
+                        continue
+                    else:
+                        raise exc
 
                 result = task.result()
                 if result is not None:
@@ -677,6 +829,9 @@ class Pipeline(Layer):
         self._apply_produced(all_produced)
         self._commit_history(all_produced, cycle_ts)
 
+        if len(self._inactive_layers) == len(self._layers):
+            pipeline_stop = True
+
         if pipeline_stop:
             raise PipelineStop()
 
@@ -691,28 +846,170 @@ class Pipeline(Layer):
             self._metrics.record_skip(layer.name)
         return should
 
+    def _process_cycle_sync(self) -> None:
+        """
+        Synchronous fast-path for pipelines without ASYNC nodes.
+        Runs INLINE directly and offloads THREAD to the thread pool.
+        """
+        self._cycle_count += 1
+        cycle_ts = time.time()
+
+        snapshot: Dict[str, Dict[str, Any]] = {
+            layer_name: dict(outputs)
+            for layer_name, outputs in self._current_values.items()
+        }
+        all_produced: Dict[str, Dict[str, Any]] = {}
+
+        if self._external_inputs:
+            ext_inputs = dict(self._external_inputs)
+            snapshot["__inputs__"] = ext_inputs
+            all_produced["__inputs__"] = ext_inputs
+
+        name_to_layer = {l.name: l for l in self._layers}
+        pending: Dict[str, int] = {
+            name: len(producers)
+            for name, producers in self._layer_producers.items()
+        }
+
+        if self._external_inputs:
+            for consumer_name in self._layer_consumers.get("__inputs__", set()):
+                pending[consumer_name] -= 1
+
+        pipeline_stop = False
+        in_flight: set = set()
+        task_to_layer: Dict[concurrent.futures.Future, Layer] = {}
+
+        def _schedule_sync(layer: Layer) -> None:
+            mode = self._effective_execution_modes.get(
+                layer.name, ExecutionMode.INLINE)
+            if mode == ExecutionMode.INLINE:
+                try:
+                    result = self._invoke_layer_sync(layer, snapshot)
+                    _commit_sync(layer, result)
+                except LayerComplete:
+                    _handle_layer_complete(layer)
+                except PipelineStop:
+                    nonlocal pipeline_stop
+                    pipeline_stop = True
+                except Exception:
+                    raise
+            else:
+                fut = self._thread_pool.submit(
+                    self._invoke_layer_sync, layer, snapshot)
+                in_flight.add(fut)
+                task_to_layer[fut] = layer
+
+        def _handle_layer_complete(layer: Layer) -> None:
+            if layer.name not in self._inactive_layers:
+                self._inactive_layers.add(layer.name)
+                for consumer_name in self._layer_consumers.get(layer.name, set()):
+                    consumer = name_to_layer[consumer_name]
+                    try:
+                        consumer.on_complete()
+                    except LayerComplete:
+                        _handle_layer_complete(consumer)
+
+            for consumer_name in self._layer_consumers.get(layer.name, set()):
+                pending[consumer_name] -= 1
+                if pending[consumer_name] == 0:
+                    consumer = name_to_layer[consumer_name]
+                    if consumer.name not in self._inactive_layers and self._should_run(consumer, snapshot):
+                        ready_queue.append(consumer)
+            _commit_sync(layer, None)
+
+        def _commit_sync(layer: Layer, result: Any) -> None:
+            if result is not None:
+                outputs = self._unpack_result(layer, result)
+                snapshot[layer.name] = {
+                    **snapshot.get(layer.name, {}), **outputs}
+                all_produced[layer.name] = outputs
+
+            for consumer_name in self._layer_consumers.get(layer.name, set()):
+                pending[consumer_name] -= 1
+                if pending[consumer_name] == 0:
+                    consumer = name_to_layer[consumer_name]
+                    if consumer.name not in self._inactive_layers and self._should_run(consumer, snapshot):
+                        ready_queue.append(consumer)
+
+        ready_queue = deque(
+            [layer for layer in self._layers if pending.get(layer.name, 0) == 0])
+
+        while ready_queue or in_flight:
+            while ready_queue:
+                layer = ready_queue.popleft()
+                if layer.name in self._inactive_layers or not self._should_run(layer, snapshot):
+                    for consumer_name in self._layer_consumers.get(layer.name, set()):
+                        pending[consumer_name] -= 1
+                        if pending.get(consumer_name, 0) == 0:
+                            ready_queue.append(name_to_layer[consumer_name])
+                    continue
+                _schedule_sync(layer)
+                if pipeline_stop:
+                    break
+
+            if pipeline_stop:
+                break
+
+            if in_flight:
+                done, in_flight = concurrent.futures.wait(
+                    in_flight, return_when=concurrent.futures.FIRST_COMPLETED)
+                for fut in done:
+                    layer = task_to_layer.pop(fut)
+                    exc = fut.exception()
+                    if exc is not None:
+                        if isinstance(exc, PipelineStop):
+                            pipeline_stop = True
+                            for f in in_flight:
+                                f.cancel()
+                            in_flight.clear()
+                            break
+                        elif isinstance(exc, LayerComplete):
+                            _handle_layer_complete(layer)
+                        else:
+                            raise exc
+                    else:
+                        _commit_sync(layer, fut.result())
+
+        self._apply_produced(all_produced)
+        self._commit_history(all_produced, cycle_ts)
+
+        if len(self._inactive_layers) == len(self._layers):
+            pipeline_stop = True
+
+        if pipeline_stop:
+            raise PipelineStop()
+
+    def _invoke_layer_sync(self, layer: Layer, snapshot: Dict) -> Any:
+        inputs = {
+            k: self._resolve_from_snapshot(dep, snapshot)
+            for k, dep in layer.parsed_dependencies.items()
+        }
+
+        if self._metrics:
+            with self._metrics.measure(layer.name):
+                result = layer.process(**inputs)
+            if result is not None:
+                self._metrics.record_outputs(
+                    layer.name, self._unpack_result(layer, result)
+                )
+            return result
+        return layer.process(**inputs)
+
     async def _invoke_layer(self, layer: Layer, snapshot: Dict) -> Any:
         inputs = {
             k: self._resolve_from_snapshot(dep, snapshot)
             for k, dep in layer.parsed_dependencies.items()
         }
 
-        try:
-            if self._metrics:
-                with self._metrics.measure(layer.name):
-                    result = await self._dispatch(layer, inputs)
-                if result is not None:
-                    self._metrics.record_outputs(
-                        layer.name, self._unpack_result(layer, result)
-                    )
-                return result
-            return await self._dispatch(layer, inputs)
-        except LayerComplete:
-            self._inactive_layers.add(layer.name)
-            return None
-        except PipelineStop:
-            self._running = False
-            raise
+        if self._metrics:
+            with self._metrics.measure(layer.name):
+                result = await self._dispatch(layer, inputs)
+            if result is not None:
+                self._metrics.record_outputs(
+                    layer.name, self._unpack_result(layer, result)
+                )
+            return result
+        return await self._dispatch(layer, inputs)
 
     async def _dispatch(self, layer: Layer, inputs: Dict) -> Any:
         mode = self._effective_execution_modes.get(
@@ -724,8 +1021,12 @@ class Pipeline(Layer):
         if mode == ExecutionMode.ASYNC:
             return await layer.aprocess(**inputs)
 
-        # THREAD mode
-        return await asyncio.to_thread(layer.process, **inputs)
+        # THREAD mode: Offload to the pipeline's explicit thread pool
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            self._thread_pool,
+            lambda: layer.process(**inputs)
+        )
 
     def _resolve_from_snapshot(self, dep: DependencyInfo, snapshot: Dict) -> Any:
         """Resolve a dependency from the tier snapshot (for current) or history."""
@@ -771,16 +1072,20 @@ class Pipeline(Layer):
         raise ValueError(f"Unsupported access type: {dep.access_type}")
 
     def _unpack_result(self, layer: Layer, result: Any) -> Dict[str, Any]:
-        if len(layer.outputs) == 1:
-            return {layer.outputs[0]: result}
+        out_names = list(layer.outputs)
+        if len(out_names) == 1:
+            return {out_names[0]: result}
         if isinstance(result, (tuple, list)):
-            return dict(zip(layer.outputs, result))
-        return {layer.outputs[0]: result}
+            return dict(zip(out_names, result))
+        return {out_names[0]: result}
 
     def _apply_produced(self, produced: Dict[str, Dict[str, Any]]) -> None:
         for layer_name, outs in produced.items():
             for out, value in outs.items():
                 self._current_values[layer_name][out] = value
+                # We register __inputs__ so nested pipeline inputs are resolvable.
+                # Since __inputs__ is applied FIRST, real layers will override it
+                # if they produce the same output name, which is correct scoping.
                 self._pipeline_outputs._set_provider(out, layer_name)
 
     def _commit_history(self, produced: Dict[str, Dict[str, Any]], cycle_ts: float) -> None:
@@ -826,29 +1131,79 @@ class Pipeline(Layer):
         visualize_pipeline(self, name, free=free)
 
     # ---- state serialization ---------------------------------------------- #
-    def save_state(self, path: str) -> None:
-        """Pickle current values and history. Layer code is not saved."""
-        state = {
+    def get_state(self) -> Dict[str, Any]:
+        """Return a dictionary of internal state to be serialized when used as a nested layer."""
+        layer_states = {}
+        for layer in self._layers:
+            layer_states[layer.name] = layer.get_state()
+
+        return {
             "cycle_count": self._cycle_count,
+            "inactive_layers": set(self._inactive_layers),
             "current_values": dict(self._current_values),
+            "layer_states": layer_states,
             "history": {
                 layer: {out: list(entries) for out, entries in outs.items()}
                 for layer, outs in self._history.items()
             },
         }
-        with open(path, "wb") as f:
-            pickle.dump(state, f)
+
+    def set_state(self, state: Dict[str, Any]) -> None:
+        """Restore internal state from a dictionary when used as a nested layer."""
+        current_layer_names = {layer.name for layer in self._layers}
+        expected_outputs = {node for node in self._graph.graph.nodes}
+
+        for layer_name, outputs in state.get("current_values", {}).items():
+            # Skip __inputs__ placeholder which is only used during a cycle
+            if layer_name == "__inputs__":
+                continue
+            if layer_name not in current_layer_names:
+                raise ValueError(f"State mismatch: Layer '{layer_name}' found in state file but not in the pipeline.")
+            for out in outputs:
+                if (layer_name, out) not in expected_outputs:
+                    raise ValueError(f"State mismatch: Output '{layer_name}.{out}' found in state file but is not expected in the pipeline.")
+
+        self._cycle_count = state.get("cycle_count", 0)
+        self._inactive_layers = set(state.get("inactive_layers", []))
+
+        self._current_values.clear()
+        self._current_values.update(state.get("current_values", {}))
+
+        self._history.clear()
+        for layer, outs in state.get("history", {}).items():
+            for out, entries in outs.items():
+                self._history[layer][out] = deque(entries, maxlen=self._max_history_size)
+
+        for layer in self._layers:
+            layer_state = state.get("layer_states", {}).get(layer.name)
+            if layer_state is not None:
+                layer.set_state(layer_state)
+
+    def save_state(self, path: str) -> None:
+        """Pickle current pipeline values, history, and layer states."""
+        if self._running:
+            raise RuntimeError(
+                "Cannot save state while the pipeline is executing.")
+
+        state = self.get_state()
+
+        try:
+            with open(path, "wb") as f:
+                pickle.dump(state, f)
+        except Exception as e:
+            raise RuntimeError(
+                f"Failed to pickle pipeline state. Ensure all layer outputs and states are picklable. Error: {e}") from e
 
     def load_state(self, path: str) -> None:
-        """Restore values and history. Pipeline structure must match."""
+        """Restore values, history, and layer states. Pipeline structure must match."""
+        if self._running:
+            raise RuntimeError(
+                "Cannot load state while the pipeline is executing.")
+
         with open(path, "rb") as f:
             state = pickle.load(f)
-        self._cycle_count = state["cycle_count"]
-        self._current_values.update(state["current_values"])
-        for layer, outs in state["history"].items():
-            for out, entries in outs.items():
-                self._history[layer][out] = deque(
-                    entries, maxlen=self._max_history_size)
+
+        self.set_state(state)
 
     # ---- garbage collection ----------------------------------------------- #
     def _garbage_collect(self) -> None:
@@ -869,14 +1224,29 @@ class Pipeline(Layer):
         Returns exported outputs in declaration order.
         """
         self._external_inputs = external_inputs
-        await self._process_cycle()
-        return self._export_results()
+        try:
+            await self._process_cycle()
+            return self._export_results()
+        except PipelineStop:
+            logger.info(
+                f"Pipeline '{self.name or 'nested_pipeline'}' completed its lifecycle.")
+            raise LayerComplete()
 
     def process(self, **external_inputs) -> Any:
         """
         Run one internal cycle sequentially. If an event loop is already running, 
         use aprocess() instead to avoid loop conflicts.
         """
+        if not self._has_async_layers():
+            self._external_inputs = external_inputs
+            try:
+                self._process_cycle_sync()
+                return self._export_results()
+            except PipelineStop:
+                logger.info(
+                    f"Pipeline '{self.name or 'nested_pipeline'}' completed its lifecycle.")
+                raise LayerComplete()
+
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
@@ -892,10 +1262,13 @@ class Pipeline(Layer):
         loop = asyncio.new_event_loop()
         try:
             loop.run_until_complete(self._process_cycle())
+            return self._export_results()
+        except PipelineStop:
+            logger.info(
+                f"Pipeline '{self.name or 'nested_pipeline'}' completed its lifecycle.")
+            raise LayerComplete()
         finally:
             loop.close()
-
-        return self._export_results()
 
     def _export_results(self) -> Any:
         export_names = self._output_names if isinstance(

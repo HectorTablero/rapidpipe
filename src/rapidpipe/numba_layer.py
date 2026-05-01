@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import inspect
+import warnings
 from abc import abstractmethod
 from typing import Any, Callable, Optional
 
@@ -48,14 +50,45 @@ class NumbaLayer(Layer):
             **kwargs: Other kwargs passed to the Layer base class.
         """
         super().__init_subclass__(**kwargs)
+
+        kernel_attr = cls.__dict__.get("kernel")
+        if kernel_attr is not None and not isinstance(kernel_attr, staticmethod):
+            raise TypeError(
+                "The 'kernel' method must be declared as a @staticmethod.")
+
         try:
             import numba
             cls._compiled_kernel = staticmethod(numba.jit(
                 nopython=nopython, cache=cache, parallel=parallel, nogil=nogil
             )(cls.kernel))
         except ImportError:
-            # Numba not installed — fall back to pure Python silently
+            # Numba not installed — fall back to pure Python with a warning
+            warnings.warn(
+                "Numba is not installed; falling back to pure Python kernel execution.", UserWarning)
             cls._compiled_kernel = staticmethod(cls.kernel)
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+
+        # Missing Support for Multiple Outputs validation
+        outputs = self._output_names
+        if len(outputs) > 1:
+            sig = inspect.signature(self.kernel)
+            ret_annotation = sig.return_annotation
+            if ret_annotation is not inspect._empty:
+                origin = getattr(ret_annotation, "__origin__", None)
+                if origin is tuple or origin is tuple:
+                    args = getattr(ret_annotation, "__args__", tuple())
+                    if args and len(args) != len(outputs) and args[-1] != Ellipsis:
+                        warnings.warn(
+                            f"Layer '{self.name}' declares {len(outputs)} outputs but kernel return type hint is {ret_annotation}",
+                            UserWarning
+                        )
+                else:
+                    warnings.warn(
+                        f"Layer '{self.name}' declares {len(outputs)} outputs but kernel return type hint is not a tuple ({ret_annotation})",
+                        UserWarning
+                    )
 
     def process(self, **inputs) -> Any:
         """
@@ -63,10 +96,12 @@ class NumbaLayer(Layer):
 
         Override in your subclass if you need to:
           1. Extract or reshape numpy arrays from inputs
-          2. Call `self._compiled_kernel(**arrays)`
+          2. Call `self._compiled_kernel(*positional_args)`
           3. Wrap the raw numeric result back into Python objects
 
-        By default, it directly executes the compiled kernel with the keyword inputs.
+        By default, it extracts values from `inputs` in the exact order
+        of the kernel's parameters using `inspect.signature`, and directly
+        executes the compiled kernel.
 
         Args:
             **inputs: Arbitrary keyword arguments mapping to the layer's declared dependencies.
@@ -74,7 +109,13 @@ class NumbaLayer(Layer):
         Returns:
             The raw return value of the underlying compiled kernel.
         """
-        return self._compiled_kernel(**inputs)
+        sig = inspect.signature(self.kernel)
+        try:
+            ordered_args = [inputs[name] for name in sig.parameters]
+        except KeyError as e:
+            raise KeyError(f"Missing required input for Numba kernel: {e}")
+
+        return self._compiled_kernel(*ordered_args)
 
     @classmethod
     def warm_up(cls, *sample_inputs) -> None:

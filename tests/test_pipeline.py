@@ -621,3 +621,146 @@ def test_garbage_collect():
     # This triggers _rebuild_graph which calls _garbage_collect
 
     assert "val" not in pipe._current_values.get("old", {})
+
+
+def test_pipeline_reset_and_layer_complete_propagation():
+    class SourceLayer(Layer):
+        def __init__(self):
+            super().__init__(name="src", outputs=["x"])
+            self.count = 0
+
+        def process(self):
+            self.count += 1
+            if self.count > 2:
+                raise LayerComplete()
+            return self.count
+
+    class ConsumerLayer(Layer):
+        def __init__(self):
+            super().__init__(name="cons", inputs={"x": "src.x"}, outputs=["y"])
+            self.completed = False
+
+        def process(self, x):
+            return x + 1
+
+        def on_complete(self):
+            self.completed = True
+            raise LayerComplete()
+
+    src = SourceLayer()
+    cons = ConsumerLayer()
+    pipe = Pipeline(src, cons)
+
+    # Run fully until all layers exhaust (src raises LayerComplete)
+    pipe.run()
+
+    assert "src" in pipe._inactive_layers
+    assert cons.completed is True
+
+    # Test bug 4 / 8 - reset functionality
+    pipe.reset()
+    assert len(pipe._inactive_layers) == 0
+    assert pipe._cycle_count == 0
+
+
+def test_pipeline_remove_inactive_layer_cleanup():
+    class SourceLayer(Layer):
+        def __init__(self):
+            super().__init__(name="src", outputs=["x"])
+
+        def process(self):
+            raise LayerComplete()
+
+    src = SourceLayer()
+    pipe = Pipeline(src)
+    pipe.run_sequence(1)
+
+    assert "src" in pipe._inactive_layers
+    pipe.remove_layer("src")
+    assert "src" not in pipe._inactive_layers
+
+
+def test_pipeline_stop_threaded_cancellation():
+    import time
+
+    class SlowThreadLayer(Layer):
+        execution_mode = ExecutionMode.THREAD
+
+        def __init__(self):
+            super().__init__(name="slow", outputs=["x"])
+
+        def process(self):
+            time.sleep(1.0)
+            return 1
+
+    class StopLayer(Layer):
+        execution_mode = ExecutionMode.THREAD
+
+        def __init__(self):
+            super().__init__(name="stopper", outputs=["y"])
+
+        def process(self):
+            raise PipelineStop()
+
+    pipe = Pipeline(SlowThreadLayer(), StopLayer())
+
+    # PipelineStop should be caught and cause a graceful stop,
+    # the ThreadPoolExecutor should be shutdown, wait=False, cancel_futures=True.
+    # No CancelledError should be bubbled up!
+    pipe.run_sequence(1)
+
+
+def test_pipeline_stop_async_cancellation():
+    import asyncio
+
+    class SlowAsyncLayer(Layer):
+        execution_mode = ExecutionMode.ASYNC
+
+        def __init__(self):
+            super().__init__(name="slow", outputs=["x"])
+
+        def process(self):
+            pass
+
+        async def aprocess(self):
+            await asyncio.sleep(1.0)
+            return 1
+
+    class StopLayer(Layer):
+        execution_mode = ExecutionMode.ASYNC
+
+        def __init__(self):
+            super().__init__(name="stopper", outputs=["y"])
+
+        def process(self):
+            pass
+
+        async def aprocess(self):
+            raise PipelineStop()
+
+    pipe = Pipeline(SlowAsyncLayer(), StopLayer())
+
+    class SyncLayer1(Layer):
+        execution_mode = ExecutionMode.INLINE
+
+        def __init__(self):
+            super().__init__(name="l1", outputs=["x"])
+
+        def process(self):
+            return 5
+
+    class SyncLayer2(Layer):
+        execution_mode = ExecutionMode.INLINE
+
+        def __init__(self):
+            super().__init__(name="l2", inputs={"x": "l1.x"}, outputs=["y"])
+
+        def process(self, x):
+            return x * 2
+
+    # Since no ASYNC mode layers exist, this must natively branch off into _process_cycle_sync
+    pipe = Pipeline(SyncLayer1(), SyncLayer2())
+    pipe.run_sequence(1)
+
+    assert getattr(pipe.outputs, "l2.y", pipe.outputs.y) == 10
+    assert pipe._cycle_count == 1

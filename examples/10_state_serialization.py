@@ -21,6 +21,12 @@ class StateLayer(Layer):
         self.val += 1
         return self.val
 
+    def get_state(self):
+        return {"val": self.val}
+
+    def set_state(self, state):
+        self.val = state.get("val", 0)
+
 
 class HistoryLayer(Layer):
     def __init__(self):
@@ -58,10 +64,6 @@ print(f"Pipeline B Initial Cycle: {pipe_b.cycle_count}")
 print(f"\nLoading state into Pipeline B...")
 pipe_b.load_state(state_file)
 print(f"Pipeline B Cycle after load: {pipe_b.cycle_count}")
-
-# We need to manually set the layer's internal state if it relies on instance vars
-# The pipeline saves the output *history*, not layer instance attributes.
-pipe_b.layers[0].val = pipe_a.layers[0].val
 
 # Run Pipeline B
 print("\nRunning Pipeline B for 2 more cycles...")

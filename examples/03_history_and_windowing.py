@@ -90,7 +90,7 @@ for i in range(N_CYCLES):
 
     # Get the window that was used
     hist = list(pipe._history["signal"]["value"])
-    window_vals = [e.value for e in hist[-3:]] if hist else []
+    window_vals = [e.value for e in hist[-4:-1]] if hist else []
 
     print(f"  {pipe.cycle_count:<6} {sig:<10} {str(lag):<14} {str(window_vals):<20} {str(avg):<10}")
 
