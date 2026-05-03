@@ -1,11 +1,15 @@
 [project]
 name = "rapidpipe"
-version = "1.0.2"
+version = "1.0.3"
 description = "A lightweight package to create and manage data pipelines."
 readme = "README.md"
 authors = [{ name = "HectorTablero", email = "hector.tablerodiaz@gmail.com" }]
 requires-python = ">=3.11"
-dependencies = ["networkx>=3.5", "numpy>=2.4.4"]
+dependencies = [
+    "networkx>=3.5",
+    "numba>=0.65.1",
+    "numpy>=2.4.4",
+]
 
 [project.scripts]
 rapidpipe = "rapidpipe:main"
