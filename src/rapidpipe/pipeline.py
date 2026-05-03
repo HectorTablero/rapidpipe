@@ -157,9 +157,10 @@ class DependencyGraph:
         # 2. Add edges + compute storage needs
         for consumer in layers.values():
             for dep in consumer.parsed_dependencies.values():
-                src_layer, src_out = self._resolve(dep)
-                if src_layer is None:
+                resolved = self._resolve(dep)
+                if resolved is None:
                     continue
+                src_layer, src_out = resolved
 
                 edge = ((src_layer, src_out), (consumer.name, dep.output_name))
                 self._graph.add_edge(*edge)
@@ -366,7 +367,9 @@ class Pipeline(Layer):
                     if dep.output_name in existing.outputs:
                         last_provider = existing.name
                         break
-                # Note: if last_provider is None, validation above would have raised an error
+                # Note: if last_provider is None, it MUST be a pipeline input (validated above)
+                if last_provider is None and dep.output_name in self.parsed_dependencies:
+                    last_provider = "__inputs__"
                 dep.resolved_layer = last_provider
         # ---------------------------------------------------------------------------------------
 

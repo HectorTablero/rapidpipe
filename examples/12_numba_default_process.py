@@ -1,5 +1,5 @@
 """
-Example 13 — Numba Default Process
+Example 12 — Numba Default Process
 ==================================
 Demonstrates how to use the `NumbaLayer` base class's default `process()`
 implementation. 
@@ -61,7 +61,7 @@ class ClipLayer(NumbaLayer):
 
 
 print("=" * 60)
-print("Example 13 - Numba Default Process")
+print("Example 12 - Numba Default Process")
 print("=" * 60)
 
 pipe = Pipeline(
@@ -78,4 +78,4 @@ print(pipe.outputs.result)
 
 
 # ── Visualize ──────────────────────────────────────────────────────────────── #
-pipe.show_graph("13 — Numba Default Process")
+pipe.show_graph("12 — Numba Default Process")
