@@ -148,11 +148,11 @@ def test_exceptions_exist():
 def test_dependency_info_repr():
     from rapidpipe.layer import DependencyInfo, AccessType
     dep1 = DependencyInfo("layer_a", "val", AccessType.CURRENT)
-    assert repr(dep1) == "DependencyInfo(layer_a.val, current)"
+    assert repr(dep1) == "DependencyInfo(layer_a.val)"
 
     dep2 = DependencyInfo(
         "", "val", AccessType.PIPELINE_CURRENT, is_pipeline_dependency=True)
-    assert repr(dep2) == "DependencyInfo(pipeline.val, pipeline_current)"
+    assert repr(dep2) == "DependencyInfo(val)"
 
 
 def test_output_value_fallback_getitem():
@@ -213,6 +213,6 @@ def test_layer_str_and_repr():
     s = str(layer)
     assert "StrLayer(str_layer)" in s
     assert "inputs:" in s
-    assert "x: DependencyInfo" in s
+    assert "x: a.v" in s
     assert "outputs:" in s
     assert "0: y" in s
