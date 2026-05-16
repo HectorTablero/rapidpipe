@@ -62,3 +62,58 @@ def test_visualize_pipeline(mock_open):
     url = mock_open.call_args[0][0]
     assert url.startswith("file://")
     assert url.endswith(".html")
+
+
+def test_mermaid_visualizer_basic():
+    pipe = Pipeline(
+        DummyVisualizerLayer("l1", outputs=["a"]),
+        DummyVisualizerLayer("l2", inputs={"val": "l1.a[-1]"}, outputs=["b"]),
+        name="root"
+    )
+
+    mermaid_code = pipe.to_mermaid(show_class_names=False)
+    assert "graph LR" in mermaid_code
+    assert 'l1["<b>l1</b>"]' in mermaid_code
+    assert 'l2["<b>l2</b>"]' in mermaid_code
+    # Check link (with labels enabled by default)
+    assert 'l1 -- "a -> val[-1]" --> l2' in mermaid_code
+    assert "subgraph Legend" in mermaid_code
+
+
+def test_mermaid_visualizer_config():
+    pipe = Pipeline(
+        DummyVisualizerLayer("l1", outputs=["a"]),
+        DummyVisualizerLayer("l2", inputs={"x": "l1.a"}),
+        name="root"
+    )
+
+    # Test hiding legend
+    code_no_legend = pipe.to_mermaid(show_legend=False)
+    assert "subgraph Legend" not in code_no_legend
+
+    # Test orientation
+    code_tb = pipe.to_mermaid(orientation="TB")
+    assert "graph TB" in code_tb
+
+    # Test hiding labels
+    code_no_labels = pipe.to_mermaid(show_dependency_labels=False, show_class_names=False)
+    assert 'l1["<b>l1</b>"]' in code_no_labels
+    assert " --> " in code_no_labels
+
+
+def test_mermaid_visualizer_nesting():
+    # multiplier from example 08 style
+    sub_l1 = DummyVisualizerLayer("sub_l1")
+    sub = Pipeline(sub_l1, name="sub")
+    root = Pipeline(sub, name="root")
+
+    # Default behavior (expand_subpipelines=False)
+    code_flat = root.to_mermaid(expand_subpipelines=False, show_class_names=False)
+    assert "subgraph sub" not in code_flat
+    assert 'sub["<b>sub</b>"]' in code_flat
+
+    # Expanded behavior
+    code_expanded = root.to_mermaid(expand_subpipelines=True, show_class_names=False)
+    assert "subgraph sub" in code_expanded
+    # sub_sub_l1 is the nested ID
+    assert 'sub_sub_l1["<b>sub_l1</b>"]' in code_expanded

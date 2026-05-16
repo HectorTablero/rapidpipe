@@ -100,3 +100,4 @@ print("=" * 60)
 
 # ── Visualize ──────────────────────────────────────────────────────────────── #
 pipe.show_graph("01 — Basic Pipeline")
+# print(pipe.to_mermaid(show_metrics=True, show_class_names=False, show_legend=False))

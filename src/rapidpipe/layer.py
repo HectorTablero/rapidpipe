@@ -61,9 +61,34 @@ class DependencyInfo:
     is_pipeline_dependency: bool = False
     resolved_layer: Optional[str] = None
 
+    def __str__(self) -> str:
+        """Returns the dependency in the string format used for specification."""
+        prefix = f"{self.layer_name}." if self.layer_name else ""
+        base = f"{prefix}{self.output_name}"
+
+        if self.access_type in (AccessType.CURRENT, AccessType.PIPELINE_CURRENT):
+            return base
+
+        if self.access_type in (AccessType.INDEXED, AccessType.PIPELINE_INDEXED):
+            return f"{base}[-{self.index}]"
+
+        if self.access_type in (AccessType.INDEX_RANGE, AccessType.PIPELINE_INDEX_RANGE):
+            start = f"-{self.index_start}" if self.index_start is not None else ""
+            end = f":-{self.index_end}" if self.index_end is not None else ":"
+            return f"{base}[{start}{end}]"
+
+        if self.access_type in (AccessType.TIME_RANGE, AccessType.PIPELINE_TIME_RANGE):
+            start = f"-{self.time_start}s" if self.time_start is not None else ""
+            end = f":-{self.time_end}s" if self.time_end is not None else ":"
+            return f"{base}[{start}{end}]"
+
+        return base
+
     def __repr__(self) -> str:
-        prefix = "pipeline." if self.is_pipeline_dependency else f"{self.layer_name}."
-        return f"DependencyInfo({prefix}{self.output_name}, {self.access_type.value})"
+        if self.resolved_layer:
+            return f'DependencyInfo({self.__str__()}, resolved_layer="{self.resolved_layer}")'
+        return f"DependencyInfo({self.__str__()})"
+
 
 
 class _OutputValue(str):

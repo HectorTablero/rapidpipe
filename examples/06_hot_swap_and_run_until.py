@@ -107,3 +107,4 @@ print("=" * 60)
 
 # ── Visualize (final state, after removal) ─────────────────────────────────── #
 pipe.show_graph("06 — After Hot-Swap & Removal")
+# print(pipe.to_mermaid(show_metrics=True, show_class_names=False, show_legend=False))

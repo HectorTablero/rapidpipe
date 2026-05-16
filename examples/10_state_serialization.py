@@ -78,3 +78,4 @@ if os.path.exists(state_file):
 print("=" * 60)
 
 pipe_a.show_graph("10 — State Serialization")
+# print(pipe_b.to_mermaid(show_metrics=True, show_class_names=False, show_legend=False))

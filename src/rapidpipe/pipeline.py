@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import asyncio
-import pickle
+import dill
 import time
+
 import logging
 import concurrent.futures
 from collections import defaultdict, deque
@@ -16,9 +17,21 @@ from rapidpipe.layer import (
     LayerComplete, PipelineStop,
 )
 from rapidpipe.metrics import MetricsCollector
-from rapidpipe.utils.visualizer import visualize_pipeline
 
 logger = logging.getLogger(__name__)
+
+# TODO: Add documentation
+# TODO: Add support for output type checking
+
+
+# LAYERS
+# TODO: Add a caching layer wrapper (lru / redis / etc.)
+# TODO: Add a map layer
+# TODO: Add file reader layers
+# TODO: Add a retry layer wrapper
+# TODO: Add a checkpoint scheduler layer
+# TODO: Add a timeout layer wrapper
+# TODO: Add a debounce layer
 
 
 # --------------------------------------------------------------------------- #
@@ -300,6 +313,11 @@ class Pipeline(Layer):
     def outputs(self) -> PipelineOutputs:
         """Get the dynamic pipeline outputs interface."""
         return self._pipeline_outputs
+
+    @property
+    def metrics(self) -> Optional[MetricsCollector]:
+        """Return the metrics collector associated with this pipeline."""
+        return self._metrics
 
     @outputs.setter
     def outputs(self, value):
@@ -679,6 +697,22 @@ class Pipeline(Layer):
         super().on_stop()
         self._call_on_stop()
 
+    # ---- context manager ---------------------------------------------------- #
+    def __enter__(self) -> "Pipeline":
+        self._call_on_start()
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        self._call_on_stop()
+
+    async def __aenter__(self) -> "Pipeline":
+        self._call_on_start()
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb) -> None:
+        self._call_on_stop()
+
+
     def _call_on_start(self) -> None:
         if self._started:
             return
@@ -698,160 +732,74 @@ class Pipeline(Layer):
             self._thread_pool.shutdown(wait=False, cancel_futures=True)
 
     # ---- core processing --------------------------------------------------- #
-    async def _process_cycle(self) -> None:
-        """
-        Execute one full pipeline cycle using fine-grained task-graph scheduling.
-
-        Instead of grouping layers into tiers and waiting for each tier to
-        complete, this scheduler launches every layer as soon as all of its
-        current-cycle producers have finished.  This eliminates the tier-barrier
-        penalty in heterogeneous DAGs.
-
-        Algorithm:
-            1. Initialize a pending-count for each layer (= number of unfinished
-               producers it depends on).
-            2. Seed the ready-set with all layers whose pending-count is 0.
-            3. Launch ready layers concurrently as asyncio Tasks.
-            4. When a task finishes, commit its outputs to the snapshot, then
-               decrement the pending-count of every consumer.  Any consumer
-               whose count reaches 0 is scheduled immediately.
-            5. Repeat until all layers are done or PipelineStop is raised.
-        """
+    def _prepare_cycle(self) -> Tuple[float, Dict, Dict, Dict[str, Layer], Dict[str, int]]:
+        """Initialize state and dependency tracking for a new execution cycle."""
         self._cycle_count += 1
         cycle_ts = time.time()
-
-        # Snapshot — shared mutable dict updated as layers complete
-        snapshot: Dict[str, Dict[str, Any]] = {
-            layer_name: dict(outputs)
-            for layer_name, outputs in self._current_values.items()
+        snapshot = {
+            name: dict(outputs)
+            for name, outputs in self._current_values.items()
         }
-        all_produced: Dict[str, Dict[str, Any]] = {}
+        all_produced = {}
 
-        # Inject external inputs into the pseudo-layer "__inputs__"
         if self._external_inputs:
-            # We copy them so layers modifying kwargs don't mutate parent inputs
             ext_inputs = dict(self._external_inputs)
             snapshot["__inputs__"] = ext_inputs
             all_produced["__inputs__"] = ext_inputs
 
         name_to_layer = {l.name: l for l in self._layers}
-
-        # Pending-count: how many producers each layer is still waiting for
-        pending: Dict[str, int] = {
+        pending = {
             name: len(producers)
             for name, producers in self._layer_producers.items()
         }
 
-        # __inputs__ is already resolved immediately
         if self._external_inputs:
             for consumer_name in self._layer_consumers.get("__inputs__", set()):
                 pending[consumer_name] -= 1
 
-        pipeline_stop = False
-        in_flight: set = set()          # set of asyncio.Task
-        task_to_layer: Dict[asyncio.Task, Layer] = {}
+        return cycle_ts, snapshot, all_produced, name_to_layer, pending
 
-        def _schedule_layer(layer: Layer) -> None:
-            """Create an asyncio.Task for a single layer."""
-            task = asyncio.ensure_future(self._invoke_layer(layer, snapshot))
-            in_flight.add(task)
-            task_to_layer[task] = layer
+    def _record_layer_result(self, layer: Layer, result: Any, snapshot: Dict, all_produced: Dict) -> None:
+        """Unpack result and update the current snapshot and produced outputs map."""
+        if result is not None:
+            outputs = self._unpack_result(layer, result)
+            snapshot[layer.name] = {
+                **snapshot.get(layer.name, {}), **outputs
+            }
+            all_produced[layer.name] = outputs
 
-        def _handle_layer_complete(layer: Layer) -> None:
-            if layer.name not in self._inactive_layers:
-                self._inactive_layers.add(layer.name)
-                for consumer_name in self._layer_consumers.get(layer.name, set()):
-                    consumer = name_to_layer[consumer_name]
-                    try:
-                        consumer.on_complete()
-                    except LayerComplete:
-                        _handle_layer_complete(consumer)
-
+    def _handle_layer_inactive(self, layer: Layer, name_to_layer: Dict, pending: Dict, ready_queue: deque) -> None:
+        """Recursively marks a layer as inactive and unblocks its consumers."""
+        if layer.name not in self._inactive_layers:
+            self._inactive_layers.add(layer.name)
             for consumer_name in self._layer_consumers.get(layer.name, set()):
-                pending[consumer_name] -= 1
-                if pending[consumer_name] == 0:
-                    consumer = name_to_layer[consumer_name]
-                    if (
-                        consumer.name not in self._inactive_layers
-                        and self._should_run(consumer, snapshot)
-                    ):
-                        _schedule_layer(consumer)
+                consumer = name_to_layer[consumer_name]
+                try:
+                    consumer.on_complete()
+                except LayerComplete:
+                    self._handle_layer_inactive(
+                        consumer, name_to_layer, pending, ready_queue)
 
-        # Seed: schedule every layer with zero pending producers
-        ready_queue = deque(
-            [layer for layer in self._layers if pending.get(layer.name, 0) == 0])
+        for consumer_name in self._layer_consumers.get(layer.name, set()):
+            pending[consumer_name] -= 1
+            if pending.get(consumer_name, 0) == 0:
+                ready_queue.append(name_to_layer[consumer_name])
 
-        while ready_queue:
-            layer = ready_queue.popleft()
-            if layer.name in self._inactive_layers:
-                # Treat inactive as instantly done — unblock consumers
-                for consumer_name in self._layer_consumers.get(layer.name, set()):
-                    pending[consumer_name] -= 1
-                    if pending.get(consumer_name, 0) == 0:
-                        ready_queue.append(name_to_layer[consumer_name])
-                continue
-            if not self._should_run(layer, snapshot):
-                for consumer_name in self._layer_consumers.get(layer.name, set()):
-                    pending[consumer_name] -= 1
-                    if pending.get(consumer_name, 0) == 0:
-                        ready_queue.append(name_to_layer[consumer_name])
-                continue
-            _schedule_layer(layer)
+    def _unblock_consumers(self, layer_name: str, name_to_layer: Dict, pending: Dict, ready_queue: deque) -> None:
+        """Decrement pending count for consumers and add to ready_queue if satisfied."""
+        for consumer_name in self._layer_consumers.get(layer_name, set()):
+            pending[consumer_name] -= 1
+            if pending.get(consumer_name, 0) == 0:
+                ready_queue.append(name_to_layer[consumer_name])
 
-        # Drain in-flight tasks one-by-one as they complete
-        while in_flight:
-            done, in_flight = await asyncio.wait(
-                in_flight, return_when=asyncio.FIRST_COMPLETED
-            )
-            for task in done:
-                layer = task_to_layer.pop(task)
-
-                # Handle exceptions
-                exc = task.exception()
-                if exc is not None:
-                    if isinstance(exc, PipelineStop):
-                        pipeline_stop = True
-                        for t in in_flight:
-                            t.cancel()
-                        continue
-                    elif isinstance(exc, asyncio.CancelledError):
-                        continue
-                    elif isinstance(exc, LayerComplete):
-                        _handle_layer_complete(layer)
-                        continue
-                    else:
-                        raise exc
-
-                result = task.result()
-                if result is not None:
-                    outputs = self._unpack_result(layer, result)
-                    snapshot[layer.name] = {
-                        **snapshot.get(layer.name, {}), **outputs
-                    }
-                    all_produced[layer.name] = outputs
-
-                # Unblock consumers of this layer
-                for consumer_name in self._layer_consumers.get(layer.name, set()):
-                    pending[consumer_name] -= 1
-                    if pending[consumer_name] == 0:
-                        consumer = name_to_layer[consumer_name]
-                        if (
-                            consumer.name not in self._inactive_layers
-                            and self._should_run(consumer, snapshot)
-                        ):
-                            _schedule_layer(consumer)
-
-            if pipeline_stop:
-                break
-
+    def _finalize_cycle(self, all_produced: Dict, cycle_ts: float, pipeline_stop: bool = False) -> None:
+        """Commit results to history and check if the pipeline should stop."""
         self._apply_produced(all_produced)
         self._commit_history(all_produced, cycle_ts)
 
-        if len(self._inactive_layers) == len(self._layers):
-            pipeline_stop = True
-
-        if pipeline_stop:
+        if pipeline_stop or len(self._inactive_layers) == len(self._layers):
             raise PipelineStop()
+
 
     def _should_run(self, layer: Layer, snapshot: Dict) -> bool:
         """Check should_run with resolved inputs from snapshot."""
@@ -864,106 +812,96 @@ class Pipeline(Layer):
             self._metrics.record_skip(layer.name)
         return should
 
-    def _process_cycle_sync(self) -> None:
-        """
-        Synchronous fast-path for pipelines without ASYNC nodes.
-        Runs INLINE directly and offloads THREAD to the thread pool.
-        """
-        self._cycle_count += 1
-        cycle_ts = time.time()
-
-        snapshot: Dict[str, Dict[str, Any]] = {
-            layer_name: dict(outputs)
-            for layer_name, outputs in self._current_values.items()
-        }
-        all_produced: Dict[str, Dict[str, Any]] = {}
-
-        if self._external_inputs:
-            ext_inputs = dict(self._external_inputs)
-            snapshot["__inputs__"] = ext_inputs
-            all_produced["__inputs__"] = ext_inputs
-
-        name_to_layer = {l.name: l for l in self._layers}
-        pending: Dict[str, int] = {
-            name: len(producers)
-            for name, producers in self._layer_producers.items()
-        }
-
-        if self._external_inputs:
-            for consumer_name in self._layer_consumers.get("__inputs__", set()):
-                pending[consumer_name] -= 1
+    async def _process_cycle(self) -> None:
+        """Execute one full pipeline cycle using fine-grained task-graph scheduling."""
+        cycle_ts, snapshot, all_produced, name_to_layer, pending = self._prepare_cycle()
 
         pipeline_stop = False
-        in_flight: set = set()
-        task_to_layer: Dict[concurrent.futures.Future, Layer] = {}
-
-        def _schedule_sync(layer: Layer) -> None:
-            mode = self._effective_execution_modes.get(
-                layer.name, ExecutionMode.INLINE)
-            if mode == ExecutionMode.INLINE:
-                try:
-                    result = self._invoke_layer_sync(layer, snapshot)
-                    _commit_sync(layer, result)
-                except LayerComplete:
-                    _handle_layer_complete(layer)
-                except PipelineStop:
-                    nonlocal pipeline_stop
-                    pipeline_stop = True
-                except Exception:
-                    raise
-            else:
-                fut = self._thread_pool.submit(
-                    self._invoke_layer_sync, layer, snapshot)
-                in_flight.add(fut)
-                task_to_layer[fut] = layer
-
-        def _handle_layer_complete(layer: Layer) -> None:
-            if layer.name not in self._inactive_layers:
-                self._inactive_layers.add(layer.name)
-                for consumer_name in self._layer_consumers.get(layer.name, set()):
-                    consumer = name_to_layer[consumer_name]
-                    try:
-                        consumer.on_complete()
-                    except LayerComplete:
-                        _handle_layer_complete(consumer)
-
-            for consumer_name in self._layer_consumers.get(layer.name, set()):
-                pending[consumer_name] -= 1
-                if pending[consumer_name] == 0:
-                    consumer = name_to_layer[consumer_name]
-                    if consumer.name not in self._inactive_layers and self._should_run(consumer, snapshot):
-                        ready_queue.append(consumer)
-            _commit_sync(layer, None)
-
-        def _commit_sync(layer: Layer, result: Any) -> None:
-            if result is not None:
-                outputs = self._unpack_result(layer, result)
-                snapshot[layer.name] = {
-                    **snapshot.get(layer.name, {}), **outputs}
-                all_produced[layer.name] = outputs
-
-            for consumer_name in self._layer_consumers.get(layer.name, set()):
-                pending[consumer_name] -= 1
-                if pending[consumer_name] == 0:
-                    consumer = name_to_layer[consumer_name]
-                    if consumer.name not in self._inactive_layers and self._should_run(consumer, snapshot):
-                        ready_queue.append(consumer)
-
+        in_flight: set[asyncio.Task] = set()
+        task_to_layer: Dict[asyncio.Task, Layer] = {}
         ready_queue = deque(
-            [layer for layer in self._layers if pending.get(layer.name, 0) == 0])
+            [l for l in self._layers if pending.get(l.name, 0) == 0])
 
         while ready_queue or in_flight:
             while ready_queue:
                 layer = ready_queue.popleft()
                 if layer.name in self._inactive_layers or not self._should_run(layer, snapshot):
-                    for consumer_name in self._layer_consumers.get(layer.name, set()):
-                        pending[consumer_name] -= 1
-                        if pending.get(consumer_name, 0) == 0:
-                            ready_queue.append(name_to_layer[consumer_name])
+                    self._unblock_consumers(
+                        layer.name, name_to_layer, pending, ready_queue)
                     continue
-                _schedule_sync(layer)
+
+                task = asyncio.ensure_future(
+                    self._invoke_layer(layer, snapshot))
+                in_flight.add(task)
+                task_to_layer[task] = layer
+
+            if in_flight:
+                done, in_flight = await asyncio.wait(
+                    in_flight, return_when=asyncio.FIRST_COMPLETED
+                )
+                for task in done:
+                    layer = task_to_layer.pop(task)
+                    try:
+                        result = task.result()
+                        self._record_layer_result(
+                            layer, result, snapshot, all_produced)
+                        self._unblock_consumers(
+                            layer.name, name_to_layer, pending, ready_queue)
+                    except LayerComplete:
+                        self._handle_layer_inactive(
+                            layer, name_to_layer, pending, ready_queue)
+                    except PipelineStop:
+                        pipeline_stop = True
+                        for t in in_flight:
+                            t.cancel()
+                        break
+                    except asyncio.CancelledError:
+                        continue
+                    except Exception:
+                        raise
                 if pipeline_stop:
                     break
+
+        self._finalize_cycle(all_produced, cycle_ts, pipeline_stop=pipeline_stop)
+
+    def _process_cycle_sync(self) -> None:
+        """Synchronous fast-path for pipelines without ASYNC nodes."""
+        cycle_ts, snapshot, all_produced, name_to_layer, pending = self._prepare_cycle()
+
+        pipeline_stop = False
+        in_flight: set[concurrent.futures.Future] = set()
+        task_to_layer: Dict[concurrent.futures.Future, Layer] = {}
+        ready_queue = deque(
+            [l for l in self._layers if pending.get(l.name, 0) == 0])
+
+        while ready_queue or in_flight:
+            while ready_queue:
+                layer = ready_queue.popleft()
+                if layer.name in self._inactive_layers or not self._should_run(layer, snapshot):
+                    self._unblock_consumers(
+                        layer.name, name_to_layer, pending, ready_queue)
+                    continue
+
+                mode = self._effective_execution_modes.get(
+                    layer.name, ExecutionMode.INLINE)
+                if mode == ExecutionMode.INLINE:
+                    try:
+                        result = self._invoke_layer_sync(layer, snapshot)
+                        self._record_layer_result(
+                            layer, result, snapshot, all_produced)
+                        self._unblock_consumers(
+                            layer.name, name_to_layer, pending, ready_queue)
+                    except LayerComplete:
+                        self._handle_layer_inactive(
+                            layer, name_to_layer, pending, ready_queue)
+                    except PipelineStop:
+                        pipeline_stop = True
+                        break
+                else:
+                    fut = self._thread_pool.submit(
+                        self._invoke_layer_sync, layer, snapshot)
+                    in_flight.add(fut)
+                    task_to_layer[fut] = layer
 
             if pipeline_stop:
                 break
@@ -973,29 +911,26 @@ class Pipeline(Layer):
                     in_flight, return_when=concurrent.futures.FIRST_COMPLETED)
                 for fut in done:
                     layer = task_to_layer.pop(fut)
-                    exc = fut.exception()
-                    if exc is not None:
-                        if isinstance(exc, PipelineStop):
-                            pipeline_stop = True
-                            for f in in_flight:
-                                f.cancel()
-                            in_flight.clear()
-                            break
-                        elif isinstance(exc, LayerComplete):
-                            _handle_layer_complete(layer)
-                        else:
-                            raise exc
-                    else:
-                        _commit_sync(layer, fut.result())
+                    try:
+                        result = fut.result()
+                        self._record_layer_result(
+                            layer, result, snapshot, all_produced)
+                        self._unblock_consumers(
+                            layer.name, name_to_layer, pending, ready_queue)
+                    except LayerComplete:
+                        self._handle_layer_inactive(
+                            layer, name_to_layer, pending, ready_queue)
+                    except PipelineStop:
+                        pipeline_stop = True
+                        for f in in_flight:
+                            f.cancel()
+                        in_flight.clear()
+                        break
+                    except Exception:
+                        raise
 
-        self._apply_produced(all_produced)
-        self._commit_history(all_produced, cycle_ts)
+        self._finalize_cycle(all_produced, cycle_ts, pipeline_stop=pipeline_stop)
 
-        if len(self._inactive_layers) == len(self._layers):
-            pipeline_stop = True
-
-        if pipeline_stop:
-            raise PipelineStop()
 
     def _invoke_layer_sync(self, layer: Layer, snapshot: Dict) -> Any:
         inputs = {
@@ -1140,7 +1075,75 @@ class Pipeline(Layer):
         return self._graph.storage_requirement(layer, output)
 
     def show_graph(self, name: str = "", free: bool = True, metrics_mode: bool = False) -> None:
+        from rapidpipe.utils.visualizer import visualize_pipeline
         visualize_pipeline(self, name, free=free)
+
+    def to_mermaid(
+        self,
+        orientation: str = "LR",
+        show_legend: bool = True,
+        show_class_names: bool = True,
+        show_metrics: bool = False,
+        show_dependency_labels: bool = True,
+        expand_subpipelines: bool = False,
+    ) -> str:
+        """
+        Generate Mermaid.js diagram code for this pipeline.
+
+        Args:
+            orientation: Mermaid graph orientation (e.g., "LR", "TB", "BT", "RL").
+            show_legend: Whether to include a color legend for execution modes.
+            show_class_names: Whether to show the Python class name under the instance name.
+            show_metrics: Whether to include latency metrics if available.
+            show_dependency_labels: Whether to label edges with the specific input/output names.
+            expand_subpipelines: Whether to render nested pipelines as subgraphs.
+        """
+        from rapidpipe.utils.mermaid import get_mermaid
+        return get_mermaid(
+            self,
+            orientation=orientation,
+            show_legend=show_legend,
+            show_class_names=show_class_names,
+            show_metrics=show_metrics,
+            show_dependency_labels=show_dependency_labels,
+            expand_subpipelines=expand_subpipelines,
+        )
+
+    def save_mermaid(
+        self,
+        path: str,
+        orientation: str = "LR",
+        show_legend: bool = True,
+        show_class_names: bool = True,
+        show_metrics: bool = False,
+        show_dependency_labels: bool = True,
+        expand_subpipelines: bool = False,
+    ) -> None:
+        """
+        Generate and save Mermaid.js diagram code to a file.
+
+        Args:
+            path: Path to the output file.
+            orientation: Mermaid graph orientation (e.g., "LR", "TB", "BT", "RL").
+            show_legend: Whether to include a color legend for execution modes.
+            show_class_names: Whether to show the Python class name under the instance name.
+            show_metrics: Whether to include latency metrics if available.
+            show_dependency_labels: Whether to label edges with the specific input/output names.
+            expand_subpipelines: Whether to render nested pipelines as subgraphs.
+        """
+        from rapidpipe.utils.mermaid import save_mermaid_to_file
+        save_mermaid_to_file(
+            self,
+            path=path,
+            orientation=orientation,
+            show_legend=show_legend,
+            show_class_names=show_class_names,
+            show_metrics=show_metrics,
+            show_dependency_labels=show_dependency_labels,
+            expand_subpipelines=expand_subpipelines,
+        )
+
+
 
     # ---- state serialization ---------------------------------------------- #
     def get_state(self) -> Dict[str, Any]:
@@ -1204,10 +1207,11 @@ class Pipeline(Layer):
 
         try:
             with open(path, "wb") as f:
-                pickle.dump(state, f)
+                dill.dump(state, f)
         except Exception as e:
             raise RuntimeError(
-                f"Failed to pickle pipeline state. Ensure all layer outputs and states are picklable. Error: {e}") from e
+                f"Failed to serialize pipeline state. Ensure all layer outputs and states are compatible with dill. Error: {e}") from e
+
 
     def load_state(self, path: str) -> None:
         """Restore values, history, and layer states. Pipeline structure must match."""
@@ -1216,7 +1220,8 @@ class Pipeline(Layer):
                 "Cannot load state while the pipeline is executing.")
 
         with open(path, "rb") as f:
-            state = pickle.load(f)
+            state = dill.load(f)
+
 
         self.set_state(state)
 

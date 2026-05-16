@@ -79,3 +79,4 @@ print(pipe.outputs.result)
 
 # ── Visualize ──────────────────────────────────────────────────────────────── #
 pipe.show_graph("12 — Numba Default Process")
+# print(pipe.to_mermaid(show_metrics=True, show_class_names=False, show_legend=False))

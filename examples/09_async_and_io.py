@@ -101,3 +101,4 @@ print(f"\nFinal combined result: {pipe.outputs.result}")
 print("=" * 60)
 
 pipe.show_graph("09 — Async IO")
+# print(pipe.to_mermaid(show_metrics=True, show_class_names=False, show_legend=False))

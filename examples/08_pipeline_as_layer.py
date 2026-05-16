@@ -127,3 +127,4 @@ if os.path.exists(state_path):
 
 # ── Visualize ──────────────────────────────────────────────────────────────── #
 parent_pipeline.show_graph("08 — Pipeline as Layer")
+# print(parent_pipeline.to_mermaid(show_metrics=True, show_class_names=True, show_legend=False))
